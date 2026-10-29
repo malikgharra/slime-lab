@@ -42,7 +42,7 @@ kbd{font:11px ui-monospace,monospace;border:1px solid var(--line);border-radius:
 <body>
 <canvas id="c"></canvas>
 <div id="stats">starting…</div>
-<div id="hint">Drag to feed · Right‑drag or Shift‑drag to scatter · <kbd>Space</kbd> pause · <kbd>R</kbd> reset · <kbd>H</kbd> hide panel · <kbd>1</kbd>–<kbd>5</kbd> presets</div>
+<div id="hint">Drag to feed · Right‑drag or Shift‑drag to scatter · <kbd>Space</kbd> pause · <kbd>R</kbd> reset · <kbd>M</kbd> sound · <kbd>H</kbd> hide panel · <kbd>1</kbd>–<kbd>5</kbd> presets</div>
 <div id="err"></div>
 
 <div id="panel">
@@ -67,6 +67,15 @@ kbd{font:11px ui-monospace,monospace;border:1px solid var(--line);border-radius:
       <label>Start shape<select id="pattern"><option value="disk">Disk, inward</option><option value="bang">Big bang</option><option value="ring">Spinning ring</option><option value="random">Random</option></select></label>
       <label>Palette<select id="palette"></select></label>
     </div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-t">Sound</div>
+    <div class="row"><button id="sound">Sound: off <kbd>M</kbd></button></div>
+    <div class="lbl"><span>Volume</span><b id="volv">70%</b></div>
+    <input type="range" id="vol" min="0" max="1" step="0.01" value="0.7">
+    <div class="lbl"><span>Tempo</span><b id="bpmv">120 bpm</b></div>
+    <input type="range" id="bpm" min="60" max="180" step="1" value="120">
   </div>
 
   <div class="sec">
@@ -209,6 +218,7 @@ uniform sampler2D uTrail;
 uniform vec2 uRes;
 uniform vec3 uGain;
 uniform vec3 uBg, uC0, uC1, uC2;
+uniform float uScan; // playhead x in 0..1, or -1 when sound is off
 out vec4 o;
 void main(){
   vec2 uv = gl_FragCoord.xy / uRes;
@@ -216,6 +226,11 @@ void main(){
   vec3 col = uBg + uC0 * t.r + uC1 * t.g + uC2 * t.b;
   float hi = max(t.r, max(t.g, t.b));
   col += vec3(pow(hi, 5.0) * 0.45);
+  if (uScan >= 0.0) {
+    float dp = abs(gl_FragCoord.x - uScan * uRes.x);
+    col *= 1.0 + 0.8 * exp(-dp / 16.0);
+    col += vec3(0.09) * exp(-dp * 0.4);
+  }
   vec2 q = uv - 0.5;
   col *= 1.0 - dot(q, q) * 0.7;
   o = vec4(clamp(col, 0.0, 1.0), 1.0);
@@ -425,7 +440,184 @@ function display() {
   gl.uniform3fv(u.uC0, hex(pal.c[0]));
   gl.uniform3fv(u.uC1, S > 1 ? hex(pal.c[1]) : [0, 0, 0]);
   gl.uniform3fv(u.uC2, S > 2 ? hex(pal.c[2]) : [0, 0, 0]);
+  gl.uniform1f(u.uScan, scanPos());
   gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// ---------- sound: a playhead sweeps the screen and the colony plays what it crosses ----------
+const GX = 32, GY = 12;
+const FS_PROBE = HEAD + `
+uniform sampler2D uTrail;
+uniform vec2 uGrid;
+out vec4 o;
+void main(){
+  vec2 cell = floor(gl_FragCoord.xy);
+  vec3 s = vec3(0.0);
+  for (int j = 0; j < 6; j++)
+    for (int i = 0; i < 6; i++)
+      s += texture(uTrail, (cell + (vec2(i, j) + 0.5) / 6.0) / uGrid).rgb;
+  o = vec4(s / 36.0, 1.0);
+}`;
+const P_PROBE = program(VS_FULL, FS_PROBE);
+const probeTex = makeTex(GX, GY, gl.RGBA32F, gl.FLOAT, gl.NEAREST, gl.CLAMP_TO_EDGE);
+const probeFbo = makeFbo(probeTex);
+const grid = new Float32Array(GX * GY * 4), dom = new Float32Array(GX * GY);
+
+const SCALE = [0, 3, 5, 7, 10]; // minor pentatonic
+const rowFreq = r => 440 * Math.pow(2, (57 + SCALE[r % 5] + 12 * Math.floor(r / 5) - 69) / 12);
+const snd = { ctx: null, on: false, vol: 0.7, bpm: 120, next: 0, step: 0, timer: 0, marks: [], mean: 0, std: 0 };
+
+// Shrink the trail to a 32×12 grid on the GPU and read it back.
+function probe() {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, probeFbo);
+  gl.viewport(0, 0, GX, GY);
+  gl.useProgram(P_PROBE.p);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, trail[ct]);
+  gl.uniform1i(P_PROBE.u.uTrail, 0); gl.uniform2f(P_PROBE.u.uGrid, GX, GY);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.readPixels(0, 0, GX, GY, gl.RGBA, gl.FLOAT, grid);
+  const S = settings.species, n = GX * GY;
+  let s = 0, s2 = 0;
+  for (let k = 0; k < n; k++) {
+    let m = grid[k * 4];
+    for (let c = 1; c < S; c++) m = Math.max(m, grid[k * 4 + c]);
+    dom[k] = m; s += m; s2 += m * m;
+  }
+  snd.mean = s / n;
+  snd.std = Math.sqrt(Math.max(0, s2 / n - snd.mean * snd.mean));
+}
+
+function impulse(ctx, sec, decay) {
+  const len = Math.floor(ctx.sampleRate * sec), b = ctx.createBuffer(2, len, ctx.sampleRate);
+  for (let c = 0; c < 2; c++) {
+    const d = b.getChannelData(c);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+  }
+  return b;
+}
+
+function initAudio() {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const out = ctx.createGain(); out.gain.value = 0;
+  const comp = ctx.createDynamicsCompressor(); comp.threshold.value = -18; comp.ratio.value = 4;
+  out.connect(comp); comp.connect(ctx.destination);
+  snd.rec = ctx.createMediaStreamDestination(); comp.connect(snd.rec);
+
+  const bus = ctx.createGain(); bus.connect(out);
+  const verb = ctx.createConvolver(); verb.buffer = impulse(ctx, 3.5, 2.5);
+  const send = ctx.createGain(); send.gain.value = 0.5;
+  bus.connect(send); send.connect(verb); verb.connect(out);
+
+  // drone that opens up as the colony gets busier
+  const dF = ctx.createBiquadFilter(); dF.type = 'lowpass'; dF.frequency.value = 200; dF.Q.value = 6;
+  const dG = ctx.createGain(); dG.gain.value = 0.035;
+  dF.connect(dG); dG.connect(bus);
+  for (const [f, det] of [[55, -7], [55, 7], [82.41, 0]]) {
+    const o = ctx.createOscillator(); o.type = 'sawtooth'; o.frequency.value = f; o.detune.value = det;
+    o.connect(dF); o.start();
+  }
+
+  // filtered noise for the brush
+  const nb = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate), nd = nb.getChannelData(0);
+  for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+  const ns = ctx.createBufferSource(); ns.buffer = nb; ns.loop = true;
+  const nF = ctx.createBiquadFilter(); nF.type = 'bandpass'; nF.Q.value = 3; nF.frequency.value = 800;
+  const nG = ctx.createGain(); nG.gain.value = 0;
+  ns.connect(nF); nF.connect(nG); nG.connect(bus); ns.start();
+
+  Object.assign(snd, { ctx, out, bus, dF, nF, nG });
+}
+
+// One instrument per species: bell, pluck, low buzz.
+function voice(species, freq, t, vel, pan) {
+  const { ctx, bus } = snd;
+  const g = ctx.createGain(), p = ctx.createStereoPanner();
+  p.pan.value = pan; g.connect(p); p.connect(bus);
+  const osc = (type, f) => { const o = ctx.createOscillator(); o.type = type; o.frequency.value = f; return o; };
+  let dur;
+  if (species === 0) {
+    dur = 1.6;
+    const a = osc('sine', freq), b = osc('sine', freq * 2.76), bg = ctx.createGain();
+    bg.gain.setValueAtTime(0.35, t); bg.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
+    a.connect(g); b.connect(bg); bg.connect(g);
+    a.start(t); b.start(t); a.stop(t + dur); b.stop(t + dur);
+  } else if (species === 1) {
+    dur = 0.8;
+    const a = osc('triangle', freq), f = ctx.createBiquadFilter();
+    f.type = 'lowpass'; f.frequency.setValueAtTime(freq * 8, t); f.frequency.exponentialRampToValueAtTime(freq * 1.2, t + 0.5);
+    a.connect(f); f.connect(g); a.start(t); a.stop(t + dur);
+  } else {
+    dur = 0.5; vel *= 0.6;
+    const a = osc('square', freq / 2), f = ctx.createBiquadFilter();
+    f.type = 'lowpass'; f.frequency.value = 900; f.Q.value = 4;
+    a.connect(f); f.connect(g); a.start(t); a.stop(t + dur);
+  }
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(vel, t + 0.006);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+}
+
+// Cells clearly denser than the rest of the screen sound a note; the three loudest win.
+function playColumn(col, t) {
+  const notes = [], S = settings.species, sd = snd.std + 1e-9;
+  for (let r = 0; r < GY; r++) {
+    const k = r * GX + col, z = (dom[k] - snd.mean) / sd;
+    if (z < 0.8) continue;
+    let ch = 0;
+    for (let c = 1; c < S; c++) if (grid[k * 4 + c] > grid[k * 4 + ch]) ch = c;
+    notes.push({ r, ch, z });
+  }
+  notes.sort((a, b) => b.z - a.z);
+  const pan = col / (GX - 1) * 1.6 - 0.8;
+  for (const n of notes.slice(0, 3)) voice(n.ch, rowFreq(n.r), t, Math.min(0.3, 0.06 + (n.z - 0.8) * 0.05), pan);
+  snd.dF.frequency.setTargetAtTime(160 + Math.min(1800, notes.length * 300), t, 0.4);
+}
+
+function schedule() {
+  const now = snd.ctx.currentTime, sd = 60 / snd.bpm / 4;
+  while (snd.next < now + 0.12) {
+    const col = snd.step % GX;
+    playColumn(col, snd.next);
+    snd.marks.push({ t: snd.next, col, sd });
+    if (snd.marks.length > 16) snd.marks.shift();
+    snd.step++; snd.next += sd;
+  }
+}
+
+function scanPos() {
+  if (!snd.on) return -1;
+  const now = snd.ctx.currentTime;
+  for (let i = snd.marks.length - 1; i >= 0; i--) {
+    const m = snd.marks[i];
+    if (m.t <= now) return (m.col + Math.min(1, (now - m.t) / m.sd)) / GX;
+  }
+  return -1;
+}
+
+function toggleSound() {
+  if (!snd.ctx) initAudio();
+  snd.on = !snd.on;
+  const ctx = snd.ctx;
+  if (snd.on) {
+    ctx.resume();
+    probe();
+    snd.next = ctx.currentTime + 0.05; snd.step = 0; snd.marks = [];
+    snd.timer = setInterval(schedule, 25);
+    snd.out.gain.setTargetAtTime(snd.vol, ctx.currentTime, 0.05);
+  } else {
+    clearInterval(snd.timer);
+    snd.out.gain.setTargetAtTime(0, ctx.currentTime, 0.05);
+    setTimeout(() => { if (!snd.on) ctx.suspend(); }, 400);
+  }
+  $('#sound').innerHTML = `Sound: ${snd.on ? 'on' : 'off'} <kbd>M</kbd>`;
+  $('#sound').classList.toggle('on', snd.on);
+}
+
+function updateBrushSound() {
+  if (!snd.on) return;
+  const t = snd.ctx.currentTime;
+  snd.nG.gain.setTargetAtTime(mouse.mode ? 0.12 : 0, t, 0.08);
+  snd.nF.frequency.setTargetAtTime(mouse.mode > 0 ? 300 + (mouse.y / H) * 2500 : 4000, t, 0.05);
 }
 
 // ---------- UI ----------
@@ -490,6 +682,13 @@ $('#pause').onclick = togglePause;
 $('#tool').onclick = () => { tool = -tool; $('#tool').textContent = 'Tool: ' + (tool > 0 ? 'Feed' : 'Scatter'); };
 $('#shot').onclick = () => { shotPending = true; };
 $('#record').onclick = toggleRecord;
+$('#sound').onclick = toggleSound;
+$('#vol').oninput = e => {
+  snd.vol = +e.target.value;
+  $('#volv').textContent = Math.round(snd.vol * 100) + '%';
+  if (snd.on) snd.out.gain.setTargetAtTime(snd.vol, snd.ctx.currentTime, 0.05);
+};
+$('#bpm').oninput = e => { snd.bpm = +e.target.value; $('#bpmv').textContent = snd.bpm + ' bpm'; };
 
 function togglePause() { paused = !paused; $('#pause').textContent = paused ? 'Play' : 'Pause'; $('#pause').classList.toggle('on', paused); }
 
@@ -504,9 +703,10 @@ function toggleRecord() {
   const btn = $('#record');
   if (recorder) { recorder.stop(); return; }
   if (!window.MediaRecorder || !canvas.captureStream) { btn.textContent = 'Not supported'; return; }
-  const mime = ['video/webm;codecs=vp9', 'video/webm', 'video/mp4'].find(t => MediaRecorder.isTypeSupported(t));
-  const chunks = [];
-  recorder = new MediaRecorder(canvas.captureStream(60), mime ? { mimeType: mime, videoBitsPerSecond: 16e6 } : {});
+  const mime = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp9', 'video/webm', 'video/mp4'].find(t => MediaRecorder.isTypeSupported(t));
+  const chunks = [], stream = canvas.captureStream(60);
+  if (snd.rec) snd.rec.stream.getAudioTracks().forEach(t => stream.addTrack(t));
+  recorder = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 16e6 } : {});
   recorder.ondataavailable = e => e.data.size && chunks.push(e.data);
   recorder.onstop = () => {
     const type = recorder.mimeType || 'video/webm';
@@ -535,6 +735,7 @@ addEventListener('keydown', e => {
   if (e.target.tagName === 'SELECT') return;
   if (e.code === 'Space') { e.preventDefault(); togglePause(); }
   else if (e.key === 'r' || e.key === 'R') seedAgents();
+  else if (e.key === 'm' || e.key === 'M') toggleSound();
   else if (e.key === 'h' || e.key === 'H') $('#panel').classList.toggle('hidden');
   else if (e.key >= '1' && e.key <= String(PRESETS.length)) applyPreset(+e.key - 1);
   else if (e.key === '0') randomize();
@@ -552,6 +753,8 @@ function loop(now) {
   const dt = now - last; last = now;
   fps += ((1000 / Math.max(dt, 1)) - fps) * 0.05;
   if (!paused) for (let i = 0; i < params.steps; i++) step();
+  if (snd.on && statTick % 3 === 0) probe();
+  updateBrushSound();
   display();
   if (shotPending) { shotPending = false; canvas.toBlob(b => b && download(b, 'slime-mold.png')); }
   if (++statTick % 15 === 0) $('#stats').textContent = `${N.toLocaleString()} agents · ${fps.toFixed(0)} fps · ${W}×${H}${paused ? ' · paused' : ''}`;
